@@ -1,0 +1,418 @@
+#include <IRremote.hpp>
+#include <Servo.h>
+
+// ===================== PINI =====================
+#define IR_PIN      3     // receptor IR (integrat pe shield)
+#define LED_PIN     9     // LED extern pentru semnalizare viteza
+#define SCL_Pin     A5    // matrice LED
+#define SDA_Pin     A4
+#define SERVO_PIN   A3
+#define TRIG_PIN    12    // ultrasunete
+#define ECHO_PIN    13
+#define LINE_L_PIN  11    // senzori linie (1 = linie neagra)
+#define LINE_M_PIN  7
+#define LINE_R_PIN  8
+#define LEFT_CTRL   2     // motoare stanga  (grup B)
+#define LEFT_PWM    5
+#define RIGHT_CTRL  4     // motoare dreapta (grup A)
+#define RIGHT_PWM   6
+
+// ===================== BUTOANE (comanda NEC din IRremote 4.x) =====================
+// Verifica-le in Serial Monitor (9600): linia "command: 0x.."
+#define KEY_FRONT 0x46
+#define KEY_BACK  0x15
+#define KEY_LEFT  0x44
+#define KEY_RIGHT 0x43
+#define KEY_STOP  0x40    // OK
+#define KEY_1     0x16
+#define KEY_2     0x19
+#define KEY_3     0x0D
+#define KEY_STAR  0x42
+#define KEY_HASH  0x4A
+
+// ===================== SETARI (le poti modifica) =====================
+#define SPEED_DEFAULT   150   // 0..255 (putere); 150 = viteza din codul oficial
+#define SPEED_MIN       90    // sub valoarea asta motoarele pot sa nu mai porneasca
+#define SPEED_MAX       255
+#define SPEED_STEP      15    // ~0.4 V pe treapta la 2 baterii 18650 (7.4 V)
+#define TURN_INNER_PCT  50    // 100 = viraj pe loc ca inainte, 0 = partea interioara sta pe loc
+#define HOLD_TIMEOUT_MS 250   // cat asteapta dupa ultimul semnal IR inainte sa opreasca
+#define PING_INTERVAL_MS 60   // pauza intre masuratori ultrasunete (min ~60 ms)
+#define AVOID_STOP_CM   15    // distanta de oprire la evitare
+#define AVOID_BACK_CM   5     // cati cm da in spate dupa oprire
+#define AVOID_PAUSE_MS  300   // pauza dupa oprire, inainte sa dea in spate
+#define AVOID_BACK_MAX_MS 1000 // siguranta: maxim cat merge in spate
+#define FOLLOW_BACK_CM  10    // mana mai aproape de atat -> da in spate
+#define FOLLOW_STOP_CM  20    // intre 10 si 20 -> sta
+#define FOLLOW_MAX_CM   50    // intre 20 si 50 -> merge dupa mana; peste -> sta
+#define BLINK_HALF_MS   70    // durata aprins/stins a LED-ului (clipire rapida)
+#define DEBUG_IR        1     // 1 = scrie in Serial Monitor codul fiecarui buton
+
+// Daca litera/fata apar rasturnate pe display, schimba aici:
+#define MATRIX_MIRROR_H 0     // 1 = oglindeste stanga-dreapta
+#define MATRIX_FLIP_V   0     // 1 = oglindeste sus-jos
+
+// ===================== MODURI / MISCARI =====================
+#define MODE_MANUAL 0
+#define MODE_AVOID  1
+#define MODE_FOLLOW 2
+#define MODE_LINE   3
+
+#define MV_NONE  0
+#define MV_FRONT 1
+#define MV_BACK  2
+#define MV_LEFT  3
+#define MV_RIGHT 4
+
+#define AV_FORWARD 0
+#define AV_PAUSE   1
+#define AV_BACK    2
+
+// ===================== FATA + LITERE (bit0 = sus, un byte = o coloana) =====================
+const uint8_t FACE[8]     = {0x3C, 0x42, 0xAD, 0xC1, 0xC1, 0xAD, 0x42, 0x3C};
+const uint8_t LETTER_E[3] = {0x1F, 0x15, 0x15};
+const uint8_t LETTER_M[3] = {0x1F, 0x06, 0x1F};
+const uint8_t LETTER_L[3] = {0x1F, 0x10, 0x10};
+
+// ===================== STARE =====================
+Servo servo_A3;
+
+uint8_t  mode = MODE_MANUAL;
+uint8_t  curMove = MV_NONE;      // ce comanda are acum motoarele
+uint8_t  heldMove = MV_NONE;     // directia tinuta apasata (mod manual)
+uint32_t lastSignalMs = 0;       // ultimul semnal IR primit pentru directia tinuta
+int      speed = SPEED_DEFAULT;
+
+uint8_t  avState = AV_FORWARD;
+uint32_t avStart = 0;
+uint32_t nextPingMs = 0;
+
+uint8_t  blinkToggles = 0;
+uint32_t blinkNextMs = 0;
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(LEFT_CTRL, OUTPUT);
+  pinMode(LEFT_PWM, OUTPUT);
+  pinMode(RIGHT_CTRL, OUTPUT);
+  pinMode(RIGHT_PWM, OUTPUT);
+  drive(MV_NONE);                       // pornim sigur, cu motoarele oprite
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LINE_L_PIN, INPUT);
+  pinMode(LINE_M_PIN, INPUT);
+  pinMode(LINE_R_PIN, INPUT);
+
+  servo_A3.attach(SERVO_PIN);           // senzorul de distanta priveste drept
+  servo_A3.write(90);
+  delay(300);
+
+  IrReceiver.begin(IR_PIN, false);      // false = fara LED feedback (pin 13 e ECHO)
+
+  pinMode(SCL_Pin, OUTPUT);
+  pinMode(SDA_Pin, OUTPUT);
+  show_face(MODE_MANUAL);
+
+  Serial.println(F("Robot pornit"));
+}
+
+void loop() {
+  handleIR();
+  updateHold();
+  updateAuto();
+  updateBlink();
+}
+
+// ===================== IR =====================
+void handleIR() {
+  if (!IrReceiver.decode()) return;
+
+  if (IrReceiver.decodedIRData.protocol != UNKNOWN) {
+    if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) {
+      // buton tinut apasat: reinnoim "permisiunea" de miscare
+      if (heldMove != MV_NONE) lastSignalMs = millis();
+    } else {
+      uint8_t cmd = IrReceiver.decodedIRData.command;
+#if DEBUG_IR
+      Serial.print(F("command: 0x"));
+      Serial.println(cmd, HEX);
+#endif
+      onKey(cmd);
+    }
+  }
+  IrReceiver.resume();
+}
+
+void onKey(uint8_t cmd) {
+  switch (cmd) {
+    case KEY_FRONT: startManual(MV_FRONT); break;
+    case KEY_BACK:  startManual(MV_BACK);  break;
+    case KEY_LEFT:  startManual(MV_LEFT);  break;
+    case KEY_RIGHT: startManual(MV_RIGHT); break;
+    case KEY_STOP:  stopAll();             break;
+    case KEY_1:     startMode(MODE_AVOID);  break;
+    case KEY_2:     startMode(MODE_FOLLOW); break;
+    case KEY_3:     startMode(MODE_LINE);   break;
+    case KEY_STAR:  changeSpeed(SPEED_STEP);  break;
+    case KEY_HASH:  changeSpeed(-SPEED_STEP); break;
+  }
+}
+
+void startManual(uint8_t m) {
+  if (mode != MODE_MANUAL) setMode(MODE_MANUAL);   // orice sageata preia comanda
+  heldMove = m;
+  lastSignalMs = millis();
+  drive(m);
+}
+
+void stopAll() {
+  heldMove = MV_NONE;
+  drive(MV_NONE);
+  if (mode != MODE_MANUAL) setMode(MODE_MANUAL);
+}
+
+void startMode(uint8_t m) {
+  heldMove = MV_NONE;
+  drive(MV_NONE);
+  avState = AV_FORWARD;
+  nextPingMs = millis();                // prima masuratoare imediat
+  setMode(m);
+}
+
+void setMode(uint8_t m) {
+  mode = m;
+  show_face(m);
+}
+
+// Mod manual: oprire cand nu mai vine semnal IR (butonul a fost eliberat)
+void updateHold() {
+  if (mode == MODE_MANUAL && heldMove != MV_NONE &&
+      (uint32_t)(millis() - lastSignalMs) > HOLD_TIMEOUT_MS) {
+    heldMove = MV_NONE;
+    drive(MV_NONE);
+  }
+}
+
+// ===================== VITEZA =====================
+void changeSpeed(int delta) {
+  int ns = speed + delta;
+  if (ns > SPEED_MAX) ns = SPEED_MAX;
+  if (ns < SPEED_MIN) ns = SPEED_MIN;
+  speed = ns;
+  if (curMove != MV_NONE) drive(curMove);          // aplica imediat daca merge
+  if ((delta > 0 && speed == SPEED_MAX) || (delta < 0 && speed == SPEED_MIN)) {
+    startBlink();                                   // ai ajuns la limita
+  }
+  Serial.print(F("viteza: "));
+  Serial.println(speed);
+}
+
+void startBlink() {
+  blinkToggles = 6;                                 // 3 clipiri = 6 schimbari
+  blinkNextMs = millis();
+}
+
+void updateBlink() {
+  if (blinkToggles == 0) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - blinkNextMs) < 0) return;
+  digitalWrite(LED_PIN, (blinkToggles % 2 == 0) ? HIGH : LOW);
+  blinkToggles--;
+  blinkNextMs = now + BLINK_HALF_MS;
+}
+
+// ===================== MODURI AUTOMATE =====================
+void updateAuto() {
+  if (mode == MODE_LINE) { runLine(); return; }
+  if (mode != MODE_AVOID && mode != MODE_FOLLOW) return;
+
+  uint32_t now = millis();
+
+  if (mode == MODE_AVOID && avState == AV_PAUSE) {   // pauza dupa oprire
+    if ((uint32_t)(now - avStart) >= AVOID_PAUSE_MS) {
+      avState = AV_BACK;
+      avStart = now;
+      drive(MV_BACK);
+      nextPingMs = now;
+    }
+    return;
+  }
+
+  if ((int32_t)(now - nextPingMs) < 0) return;
+  int d = readDistanceCm();                          // 0 = fara ecou / necunoscut
+  now = millis();
+  nextPingMs = now + PING_INTERVAL_MS;
+
+  if (mode == MODE_AVOID) {
+    if (avState == AV_FORWARD) {
+      if (d > 0 && d <= AVOID_STOP_CM) {
+        drive(MV_NONE);
+        avState = AV_PAUSE;
+        avStart = now;
+      } else {
+        drive(MV_FRONT);
+      }
+    } else if (avState == AV_BACK) {
+      if (d >= AVOID_STOP_CM + AVOID_BACK_CM ||
+          (uint32_t)(now - avStart) >= AVOID_BACK_MAX_MS) {
+        drive(MV_NONE);
+        setMode(MODE_MANUAL);                        // iti revine comanda
+      }
+    }
+  } else {                                           // MODE_FOLLOW
+    if (d <= 0)                       drive(MV_NONE);
+    else if (d <= FOLLOW_BACK_CM)     drive(MV_BACK);
+    else if (d < FOLLOW_STOP_CM)      drive(MV_NONE);
+    else if (d <= FOLLOW_MAX_CM)      drive(MV_FRONT);
+    else                              drive(MV_NONE);
+  }
+}
+
+void runLine() {
+  bool l = digitalRead(LINE_L_PIN);
+  bool m = digitalRead(LINE_M_PIN);
+  bool r = digitalRead(LINE_R_PIN);
+  uint8_t mv;
+  if (l && !r)       mv = MV_LEFT;
+  else if (!l && r)  mv = MV_RIGHT;
+  else               mv = m ? MV_FRONT : MV_NONE;
+  if (mv != curMove) drive(mv);
+}
+
+int readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long us = pulseIn(ECHO_PIN, HIGH, 25000UL);   // timeout ~4 m (fara blocare 1 s)
+  return (int)(us / 58);
+}
+
+// ===================== MOTOARE =====================
+// power > 0 inainte, < 0 inapoi, 0 stop (max 255).
+// DRV8833: cu directia HIGH, PWM mic = viteza mare, deci PWM = 255 - power.
+void setSide(uint8_t ctrlPin, uint8_t pwmPin, int power) {
+  if (power > 0) {
+    if (power > 255) power = 255;
+    digitalWrite(ctrlPin, HIGH);
+    analogWrite(pwmPin, 255 - power);
+  } else if (power < 0) {
+    power = -power;
+    if (power > 255) power = 255;
+    digitalWrite(ctrlPin, LOW);
+    analogWrite(pwmPin, power);
+  } else {
+    digitalWrite(ctrlPin, LOW);                      // stop: directie LOW + PWM 0
+    analogWrite(pwmPin, 0);
+  }
+}
+
+// Rotile de pe aceeasi parte sunt legate in paralel pe shield, deci se comanda
+// ca o singura parte. La viraj: partea exterioara inainte, cea interioara
+// inapoi cu TURN_INNER_PCT% din viteza.
+void drive(uint8_t m) {
+  int s = speed;
+  int inner = (s * TURN_INNER_PCT) / 100;
+  curMove = m;
+  switch (m) {
+    case MV_FRONT:
+      setSide(LEFT_CTRL, LEFT_PWM, s);
+      setSide(RIGHT_CTRL, RIGHT_PWM, s);
+      break;
+    case MV_BACK:
+      setSide(LEFT_CTRL, LEFT_PWM, -s);
+      setSide(RIGHT_CTRL, RIGHT_PWM, -s);
+      break;
+    case MV_LEFT:
+      setSide(LEFT_CTRL, LEFT_PWM, -inner);
+      setSide(RIGHT_CTRL, RIGHT_PWM, s);
+      break;
+    case MV_RIGHT:
+      setSide(LEFT_CTRL, LEFT_PWM, s);
+      setSide(RIGHT_CTRL, RIGHT_PWM, -inner);
+      break;
+    default:
+      setSide(LEFT_CTRL, LEFT_PWM, 0);
+      setSide(RIGHT_CTRL, RIGHT_PWM, 0);
+      break;
+  }
+}
+
+// ===================== MATRICE LED =====================
+// Fata mare in centru (coloanele 4..11) + litera modului in coltul din stanga.
+void show_face(uint8_t m) {
+  uint8_t frame[16];
+  for (uint8_t i = 0; i < 16; i++) frame[i] = 0;
+  for (uint8_t i = 0; i < 8; i++) frame[4 + i] = FACE[i];
+
+  const uint8_t *g = 0;
+  if (m == MODE_AVOID)       g = LETTER_E;
+  else if (m == MODE_FOLLOW) g = LETTER_M;
+  else if (m == MODE_LINE)   g = LETTER_L;
+  if (g) for (uint8_t i = 0; i < 3; i++) frame[i] = g[i];
+
+#if MATRIX_FLIP_V
+  for (uint8_t i = 0; i < 16; i++) {
+    uint8_t b = frame[i], r = 0;
+    for (uint8_t k = 0; k < 8; k++) { r = (r << 1) | (b & 1); b >>= 1; }
+    frame[i] = r;
+  }
+#endif
+#if MATRIX_MIRROR_H
+  for (uint8_t i = 0; i < 8; i++) {
+    uint8_t t = frame[i]; frame[i] = frame[15 - i]; frame[15 - i] = t;
+  }
+#endif
+  matrix_display(frame);
+}
+
+void matrix_display(const uint8_t *matrix_value) {
+  IIC_start();
+  IIC_send(0xc0);
+  for (uint8_t i = 0; i < 16; i++) {
+    IIC_send(matrix_value[i]);
+  }
+  IIC_end();
+  IIC_start();
+  IIC_send(0x8A);
+  IIC_end();
+}
+
+void IIC_start() {
+  digitalWrite(SDA_Pin, HIGH);
+  digitalWrite(SCL_Pin, HIGH);
+  delayMicroseconds(3);
+  digitalWrite(SDA_Pin, LOW);
+  delayMicroseconds(3);
+  digitalWrite(SCL_Pin, LOW);
+}
+
+void IIC_end() {
+  digitalWrite(SCL_Pin, LOW);
+  digitalWrite(SDA_Pin, LOW);
+  delayMicroseconds(3);
+  digitalWrite(SCL_Pin, HIGH);
+  delayMicroseconds(3);
+  digitalWrite(SDA_Pin, HIGH);
+  delayMicroseconds(3);
+}
+
+void IIC_send(unsigned char send_data) {
+  for (byte mask = 0x01; mask != 0; mask <<= 1) {
+    if (send_data & mask) {
+      digitalWrite(SDA_Pin, HIGH);
+    } else {
+      digitalWrite(SDA_Pin, LOW);
+    }
+    delayMicroseconds(3);
+    digitalWrite(SCL_Pin, HIGH);
+    delayMicroseconds(3);
+    digitalWrite(SCL_Pin, LOW);
+  }
+}
