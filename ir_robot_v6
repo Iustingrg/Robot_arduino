@@ -1,3 +1,25 @@
+/*
+  Keyestudio 4WD BT Car V2.0 (KS0559, driver DRV8833)
+  Robot controlat cu telecomanda IR  -  biblioteca IRremote 4.x   (v6)
+
+  TELECOMANDA
+    Sus / Jos / Stanga / Dreapta : robotul merge DOAR cat tii butonul apasat
+    OK                           : stop (o singura apasare) + iese din orice mod
+    1  PAZA (A)    : tu conduci. Daca mergi inainte si apare ceva la <= 15 cm,
+                     robotul se opreste, da putin in spate si NU te mai lasa inainte
+                     cat tii apasat; dai drumul la buton si il poti apasa din nou.
+                     Inapoi / stanga / dreapta merg liber. Nu porneste singur.
+    2  URMARIRE MANA (M) : tine distanta fata de mana ta (OK = iesire)
+    3  URMARIRE LINIE (L) : urmareste linia neagra de pe jos (OK = iesire)
+    *  treapta de viteza mai mare   (3 trepte; la maxim LED-ul D9 clipeste de 3 ori)
+    #  treapta de viteza mai mica   (la minim LED-ul D9 clipeste de 3 ori)
+
+  DISPLAY: fata mare mereu in centru; in coltul din stanga litera modului: A, M sau L.
+
+  La pornire robotul testeaza senzorul de distanta si scrie rezultatul in
+  Serial Monitor (9600 baud). Daca Trig si Echo sunt inversate, le detecteaza singur.
+*/
+
 #include <IRremote.hpp>
 #include <Servo.h>
 
@@ -7,7 +29,7 @@
 #define SCL_Pin     A5    // matrice LED
 #define SDA_Pin     A4
 #define SERVO_PIN   A3
-#define TRIG_PIN    12    // ultrasunete
+#define TRIG_PIN    12    // ultrasunete (se pot inversa automat la pornire)
 #define ECHO_PIN    13
 #define LINE_L_PIN  11    // senzori linie (1 = linie neagra)
 #define LINE_M_PIN  7
@@ -31,22 +53,28 @@
 #define KEY_HASH  0x4A
 
 // ===================== SETARI (le poti modifica) =====================
-#define SPEED_DEFAULT   150   // 0..255 (putere); 150 = viteza din codul oficial
-#define SPEED_MIN       90    // sub valoarea asta motoarele pot sa nu mai porneasca
-#define SPEED_MAX       255
-#define SPEED_STEP      15    // ~0.4 V pe treapta la 2 baterii 18650 (7.4 V)
-#define TURN_INNER_PCT  50    // 100 = viraj pe loc ca inainte, 0 = partea interioara sta pe loc
-#define HOLD_TIMEOUT_MS 250   // cat asteapta dupa ultimul semnal IR inainte sa opreasca
+// Cele 3 trepte de viteza (putere 0..255): mica, medie, mare. Porneste pe cea medie.
+const int SPEED_LEVELS[3] = {110, 160, 220};
+
+#define TURN_INNER_PCT   50   // la viraj, partea interioara merge inapoi cu atatea % din viteza
+#define TURN_INNER_MIN   100  // ...dar nu mai putin de atat (sub ~100 motoarele "tremura" si nu invart)
+#define LEFT_TRIM_PCT    100  // corectie viteza partea stanga  (ex. 110 daca e mai slaba)
+#define RIGHT_TRIM_PCT   100  // corectie viteza partea dreapta (ex. 90 daca e mai puternica)
+
+#define HOLD_TIMEOUT_MS  250  // cat asteapta dupa ultimul semnal IR inainte sa opreasca
 #define PING_INTERVAL_MS 60   // pauza intre masuratori ultrasunete (min ~60 ms)
-#define AVOID_STOP_CM   15    // distanta de oprire la evitare
-#define AVOID_BACK_CM   5     // cati cm da in spate dupa oprire
-#define AVOID_PAUSE_MS  300   // pauza dupa oprire, inainte sa dea in spate
-#define AVOID_BACK_MAX_MS 1000 // siguranta: maxim cat merge in spate
-#define FOLLOW_BACK_CM  10    // mana mai aproape de atat -> da in spate
+
+#define AVOID_STOP_CM       15  // distanta de oprire in modul paza
+#define AVOID_BACK_CM       5   // cat se da inapoi dupa oprire (0 = doar se opreste)
+#define AVOID_BACKOFF_MAX_MS 500 // siguranta: maxim cat merge inapoi
+
+#define FOLLOW_BACK_CM  10    // mana mai aproape de atat -> da inapoi
 #define FOLLOW_STOP_CM  20    // intre 10 si 20 -> sta
 #define FOLLOW_MAX_CM   50    // intre 20 si 50 -> merge dupa mana; peste -> sta
+
 #define BLINK_HALF_MS   70    // durata aprins/stins a LED-ului (clipire rapida)
 #define DEBUG_IR        1     // 1 = scrie in Serial Monitor codul fiecarui buton
+#define DEBUG_DIST      1     // 1 = scrie distanta masurata (modurile 1 si 2)
 
 // Daca litera/fata apar rasturnate pe display, schimba aici:
 #define MATRIX_MIRROR_H 0     // 1 = oglindeste stanga-dreapta
@@ -64,13 +92,12 @@
 #define MV_LEFT  3
 #define MV_RIGHT 4
 
-#define AV_FORWARD 0
-#define AV_PAUSE   1
-#define AV_BACK    2
+#define AV_IDLE    0
+#define AV_BACKOFF 1
 
 // ===================== FATA + LITERE (bit0 = sus, un byte = o coloana) =====================
 const uint8_t FACE[8]     = {0x3C, 0x42, 0xAD, 0xC1, 0xC1, 0xAD, 0x42, 0x3C};
-const uint8_t LETTER_E[3] = {0x1F, 0x15, 0x15};
+const uint8_t LETTER_A[3] = {0x1E, 0x05, 0x1E};
 const uint8_t LETTER_M[3] = {0x1F, 0x06, 0x1F};
 const uint8_t LETTER_L[3] = {0x1F, 0x10, 0x10};
 
@@ -79,11 +106,15 @@ Servo servo_A3;
 
 uint8_t  mode = MODE_MANUAL;
 uint8_t  curMove = MV_NONE;      // ce comanda are acum motoarele
-uint8_t  heldMove = MV_NONE;     // directia tinuta apasata (mod manual)
+uint8_t  heldMove = MV_NONE;     // directia tinuta apasata
 uint32_t lastSignalMs = 0;       // ultimul semnal IR primit pentru directia tinuta
-int      speed = SPEED_DEFAULT;
+uint8_t  speedLevel = 1;         // 0 / 1 / 2
+int      speed = 160;
 
-uint8_t  avState = AV_FORWARD;
+uint8_t  trigPin = TRIG_PIN;
+uint8_t  echoPin = ECHO_PIN;
+
+uint8_t  avState = AV_IDLE;
 uint32_t avStart = 0;
 uint32_t nextPingMs = 0;
 
@@ -98,15 +129,15 @@ void setup() {
   pinMode(LEFT_PWM, OUTPUT);
   pinMode(RIGHT_CTRL, OUTPUT);
   pinMode(RIGHT_PWM, OUTPUT);
+  speed = SPEED_LEVELS[speedLevel];
   drive(MV_NONE);                       // pornim sigur, cu motoarele oprite
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
   pinMode(LINE_L_PIN, INPUT);
   pinMode(LINE_M_PIN, INPUT);
   pinMode(LINE_R_PIN, INPUT);
+  setUltrasonicPins(TRIG_PIN, ECHO_PIN);
 
   servo_A3.attach(SERVO_PIN);           // senzorul de distanta priveste drept
   servo_A3.write(90);
@@ -118,6 +149,7 @@ void setup() {
   pinMode(SDA_Pin, OUTPUT);
   show_face(MODE_MANUAL);
 
+  checkUltrasonic();
   Serial.println(F("Robot pornit"));
 }
 
@@ -158,15 +190,29 @@ void onKey(uint8_t cmd) {
     case KEY_1:     startMode(MODE_AVOID);  break;
     case KEY_2:     startMode(MODE_FOLLOW); break;
     case KEY_3:     startMode(MODE_LINE);   break;
-    case KEY_STAR:  changeSpeed(SPEED_STEP);  break;
-    case KEY_HASH:  changeSpeed(-SPEED_STEP); break;
+    case KEY_STAR:  changeSpeed(+1);        break;
+    case KEY_HASH:  changeSpeed(-1);        break;
   }
 }
 
 void startManual(uint8_t m) {
-  if (mode != MODE_MANUAL) setMode(MODE_MANUAL);   // orice sageata preia comanda
+  // din urmarire mana / linie, orice sageata preia comanda; modul paza ramane activ
+  if (mode == MODE_FOLLOW || mode == MODE_LINE) setMode(MODE_MANUAL);
+  if (mode == MODE_AVOID && avState == AV_BACKOFF) return;   // se retrage, ignoram tastele
+
   heldMove = m;
   lastSignalMs = millis();
+
+  if (mode == MODE_AVOID && m == MV_FRONT) {
+    int d = readDistanceCm();
+    dbgDist(d);
+    if (d > 0 && d <= AVOID_STOP_CM) {   // obstacol prea aproape: nu pornim inainte
+      heldMove = MV_NONE;                // repetarile aceluiasi buton sunt ignorate
+      drive(MV_NONE);
+      return;
+    }
+    nextPingMs = millis() + PING_INTERVAL_MS;
+  }
   drive(m);
 }
 
@@ -178,38 +224,39 @@ void stopAll() {
 
 void startMode(uint8_t m) {
   heldMove = MV_NONE;
-  drive(MV_NONE);
-  avState = AV_FORWARD;
+  drive(MV_NONE);                       // modurile nu pornesc singure motoarele aici
   nextPingMs = millis();                // prima masuratoare imediat
   setMode(m);
 }
 
 void setMode(uint8_t m) {
   mode = m;
+  avState = AV_IDLE;
   show_face(m);
 }
 
-// Mod manual: oprire cand nu mai vine semnal IR (butonul a fost eliberat)
+// Oprire cand nu mai vine semnal IR (butonul a fost eliberat)
 void updateHold() {
-  if (mode == MODE_MANUAL && heldMove != MV_NONE &&
+  if ((mode == MODE_MANUAL || mode == MODE_AVOID) && heldMove != MV_NONE &&
       (uint32_t)(millis() - lastSignalMs) > HOLD_TIMEOUT_MS) {
     heldMove = MV_NONE;
     drive(MV_NONE);
   }
 }
 
-// ===================== VITEZA =====================
-void changeSpeed(int delta) {
-  int ns = speed + delta;
-  if (ns > SPEED_MAX) ns = SPEED_MAX;
-  if (ns < SPEED_MIN) ns = SPEED_MIN;
-  speed = ns;
+// ===================== VITEZA (3 trepte) =====================
+void changeSpeed(int dir) {
+  int nl = (int)speedLevel + dir;
+  if (nl > 2) nl = 2;
+  if (nl < 0) nl = 0;
+  speedLevel = (uint8_t)nl;
+  speed = SPEED_LEVELS[speedLevel];
   if (curMove != MV_NONE) drive(curMove);          // aplica imediat daca merge
-  if ((delta > 0 && speed == SPEED_MAX) || (delta < 0 && speed == SPEED_MIN)) {
+  if ((dir > 0 && nl == 2) || (dir < 0 && nl == 0)) {
     startBlink();                                   // ai ajuns la limita
   }
-  Serial.print(F("viteza: "));
-  Serial.println(speed);
+  Serial.print(F("treapta viteza: "));
+  Serial.println(speedLevel + 1);
 }
 
 void startBlink() {
@@ -226,53 +273,72 @@ void updateBlink() {
   blinkNextMs = now + BLINK_HALF_MS;
 }
 
-// ===================== MODURI AUTOMATE =====================
+// ===================== MODURI =====================
 void updateAuto() {
-  if (mode == MODE_LINE) { runLine(); return; }
-  if (mode != MODE_AVOID && mode != MODE_FOLLOW) return;
+  if (mode == MODE_LINE)   { runLine();   return; }
+  if (mode == MODE_AVOID)  { runGuard();  return; }
+  if (mode == MODE_FOLLOW) { runFollow(); return; }
+}
 
+// Modul 1 - paza: nu porneste singur; verifica doar cat mergi inainte.
+void runGuard() {
   uint32_t now = millis();
 
-  if (mode == MODE_AVOID && avState == AV_PAUSE) {   // pauza dupa oprire
-    if ((uint32_t)(now - avStart) >= AVOID_PAUSE_MS) {
-      avState = AV_BACK;
-      avStart = now;
-      drive(MV_BACK);
-      nextPingMs = now;
+  if (avState == AV_BACKOFF) {                       // retragere dupa oprire
+    if ((int32_t)(now - nextPingMs) < 0) {
+      if ((uint32_t)(now - avStart) >= AVOID_BACKOFF_MAX_MS) endBackoff();
+      return;
     }
+    int d = readDistanceCm();
+    now = millis();
+    nextPingMs = now + PING_INTERVAL_MS;
+    dbgDist(d);
+    if (d >= AVOID_STOP_CM + AVOID_BACK_CM ||
+        (uint32_t)(now - avStart) >= AVOID_BACKOFF_MAX_MS) endBackoff();
     return;
   }
 
+  if (curMove != MV_FRONT) return;                   // verificam doar la mers inainte
   if ((int32_t)(now - nextPingMs) < 0) return;
-  int d = readDistanceCm();                          // 0 = fara ecou / necunoscut
+  int d = readDistanceCm();
   now = millis();
   nextPingMs = now + PING_INTERVAL_MS;
+  dbgDist(d);
 
-  if (mode == MODE_AVOID) {
-    if (avState == AV_FORWARD) {
-      if (d > 0 && d <= AVOID_STOP_CM) {
-        drive(MV_NONE);
-        avState = AV_PAUSE;
-        avStart = now;
-      } else {
-        drive(MV_FRONT);
-      }
-    } else if (avState == AV_BACK) {
-      if (d >= AVOID_STOP_CM + AVOID_BACK_CM ||
-          (uint32_t)(now - avStart) >= AVOID_BACK_MAX_MS) {
-        drive(MV_NONE);
-        setMode(MODE_MANUAL);                        // iti revine comanda
-      }
+  if (d > 0 && d <= AVOID_STOP_CM) {
+    heldMove = MV_NONE;                              // butonul tinut nu mai are efect
+    if (AVOID_BACK_CM > 0) {
+      avState = AV_BACKOFF;
+      avStart = now;
+      nextPingMs = now;
+      drive(MV_BACK);
+    } else {
+      drive(MV_NONE);
     }
-  } else {                                           // MODE_FOLLOW
-    if (d <= 0)                       drive(MV_NONE);
-    else if (d <= FOLLOW_BACK_CM)     drive(MV_BACK);
-    else if (d < FOLLOW_STOP_CM)      drive(MV_NONE);
-    else if (d <= FOLLOW_MAX_CM)      drive(MV_FRONT);
-    else                              drive(MV_NONE);
   }
 }
 
+void endBackoff() {
+  drive(MV_NONE);
+  avState = AV_IDLE;
+}
+
+// Modul 2 - urmarire mana
+void runFollow() {
+  uint32_t now = millis();
+  if ((int32_t)(now - nextPingMs) < 0) return;
+  int d = readDistanceCm();                          // 0 = fara ecou / necunoscut
+  nextPingMs = millis() + PING_INTERVAL_MS;
+  dbgDist(d);
+
+  if (d <= 0)                    drive(MV_NONE);
+  else if (d <= FOLLOW_BACK_CM)  drive(MV_BACK);
+  else if (d < FOLLOW_STOP_CM)   drive(MV_NONE);
+  else if (d <= FOLLOW_MAX_CM)   drive(MV_FRONT);
+  else                           drive(MV_NONE);
+}
+
+// Modul 3 - urmarire linie
 void runLine() {
   bool l = digitalRead(LINE_L_PIN);
   bool m = digitalRead(LINE_M_PIN);
@@ -284,14 +350,66 @@ void runLine() {
   if (mv != curMove) drive(mv);
 }
 
+// ===================== ULTRASUNETE =====================
+void setUltrasonicPins(uint8_t trig, uint8_t echo) {
+  trigPin = trig;
+  echoPin = echo;
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  digitalWrite(trigPin, LOW);
+}
+
 int readDistanceCm() {
-  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
+  digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-  unsigned long us = pulseIn(ECHO_PIN, HIGH, 25000UL);   // timeout ~4 m (fara blocare 1 s)
+  digitalWrite(trigPin, LOW);
+  unsigned long us = pulseIn(echoPin, HIGH, 25000UL);   // timeout ~4 m (fara blocare 1 s)
   return (int)(us / 58);
+}
+
+int countEchoes() {
+  int ok = 0;
+  for (uint8_t i = 0; i < 5; i++) {
+    if (readDistanceCm() > 0) ok++;
+    delay(40);
+  }
+  return ok;
+}
+
+// Test la pornire: scrie in Serial Monitor daca senzorul raspunde; daca nu,
+// incearca Trig/Echo inversate si pastreaza varianta care merge.
+void checkUltrasonic() {
+  int ok = countEchoes();
+  if (ok == 0) {
+    setUltrasonicPins(ECHO_PIN, TRIG_PIN);
+    int okSwapped = countEchoes();
+    if (okSwapped == 0) {
+      setUltrasonicPins(TRIG_PIN, ECHO_PIN);
+      Serial.println(F("Ultrasunete: NU primesc ecou (verifica cablajul/senzorul)"));
+      return;
+    }
+    Serial.println(F("Ultrasunete: OK, Trig/Echo erau inversate (corectat automat)"));
+    return;
+  }
+  Serial.print(F("Ultrasunete: OK, distanta acum "));
+  Serial.print(readDistanceCm());
+  Serial.println(F(" cm"));
+}
+
+void dbgDist(int d) {
+#if DEBUG_DIST
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if ((uint32_t)(now - last) >= 300) {
+    last = now;
+    Serial.print(F("dist cm: "));
+    Serial.println(d);
+  }
+#else
+  (void)d;
+#endif
 }
 
 // ===================== MOTOARE =====================
@@ -313,34 +431,24 @@ void setSide(uint8_t ctrlPin, uint8_t pwmPin, int power) {
   }
 }
 
+void setLeft(int p)  { setSide(LEFT_CTRL,  LEFT_PWM,  (int)((long)p * LEFT_TRIM_PCT  / 100)); }
+void setRight(int p) { setSide(RIGHT_CTRL, RIGHT_PWM, (int)((long)p * RIGHT_TRIM_PCT / 100)); }
+
 // Rotile de pe aceeasi parte sunt legate in paralel pe shield, deci se comanda
 // ca o singura parte. La viraj: partea exterioara inainte, cea interioara
-// inapoi cu TURN_INNER_PCT% din viteza.
+// inapoi (TURN_INNER_PCT% din viteza, minim TURN_INNER_MIN).
 void drive(uint8_t m) {
   int s = speed;
   int inner = (s * TURN_INNER_PCT) / 100;
+  if (inner < TURN_INNER_MIN) inner = TURN_INNER_MIN;
+  if (inner > s) inner = s;
   curMove = m;
   switch (m) {
-    case MV_FRONT:
-      setSide(LEFT_CTRL, LEFT_PWM, s);
-      setSide(RIGHT_CTRL, RIGHT_PWM, s);
-      break;
-    case MV_BACK:
-      setSide(LEFT_CTRL, LEFT_PWM, -s);
-      setSide(RIGHT_CTRL, RIGHT_PWM, -s);
-      break;
-    case MV_LEFT:
-      setSide(LEFT_CTRL, LEFT_PWM, -inner);
-      setSide(RIGHT_CTRL, RIGHT_PWM, s);
-      break;
-    case MV_RIGHT:
-      setSide(LEFT_CTRL, LEFT_PWM, s);
-      setSide(RIGHT_CTRL, RIGHT_PWM, -inner);
-      break;
-    default:
-      setSide(LEFT_CTRL, LEFT_PWM, 0);
-      setSide(RIGHT_CTRL, RIGHT_PWM, 0);
-      break;
+    case MV_FRONT: setLeft(s);       setRight(s);       break;
+    case MV_BACK:  setLeft(-s);      setRight(-s);      break;
+    case MV_LEFT:  setLeft(-inner);  setRight(s);       break;
+    case MV_RIGHT: setLeft(s);       setRight(-inner);  break;
+    default:       setLeft(0);       setRight(0);       break;
   }
 }
 
@@ -352,7 +460,7 @@ void show_face(uint8_t m) {
   for (uint8_t i = 0; i < 8; i++) frame[4 + i] = FACE[i];
 
   const uint8_t *g = 0;
-  if (m == MODE_AVOID)       g = LETTER_E;
+  if (m == MODE_AVOID)       g = LETTER_A;
   else if (m == MODE_FOLLOW) g = LETTER_M;
   else if (m == MODE_LINE)   g = LETTER_L;
   if (g) for (uint8_t i = 0; i < 3; i++) frame[i] = g[i];
