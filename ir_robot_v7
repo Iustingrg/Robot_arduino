@@ -1,6 +1,6 @@
 /*
   Keyestudio 4WD BT Car V2.0 (KS0559, driver DRV8833)
-  Robot controlat cu telecomanda IR  -  biblioteca IRremote 4.x   (v6)
+  Robot controlat cu telecomanda IR  -  biblioteca IRremote 4.x   (v7)
 
   TELECOMANDA
     Sus / Jos / Stanga / Dreapta : robotul merge DOAR cat tii butonul apasat
@@ -8,11 +8,16 @@
     1  PAZA (A)    : tu conduci. Daca mergi inainte si apare ceva la <= 15 cm,
                      robotul se opreste, da putin in spate si NU te mai lasa inainte
                      cat tii apasat; dai drumul la buton si il poti apasa din nou.
-                     Inapoi / stanga / dreapta merg liber. Nu porneste singur.
-    2  URMARIRE MANA (M) : tine distanta fata de mana ta (OK = iesire)
+    2  URMARIRE MANA (M) : servo-ul scaneaza, gaseste mana, o urmareste si se
+                     intoarce spre ea; apoi tine distanta (OK = iesire)
     3  URMARIRE LINIE (L) : urmareste linia neagra de pe jos (OK = iesire)
+    0  cat tii apasat: servo-ul se misca stanga-dreapta; la eliberare revine la 90.
+       Cat e apasat, robotul sta pe loc si modurile 2/3 sunt in pauza.
+    4  cat tii apasat: se invarta pe loc spre STANGA foarte rapid + LED D9 clipeste rapid
+    6  cat tii apasat: se invarta pe loc spre DREAPTA foarte rapid + LED D9 clipeste rapid
     *  treapta de viteza mai mare   (3 trepte; la maxim LED-ul D9 clipeste de 3 ori)
     #  treapta de viteza mai mica   (la minim LED-ul D9 clipeste de 3 ori)
+    7, 8, 9 : rezervate pentru display (nefolosite deocamdata)
 
   DISPLAY: fata mare mereu in centru; in coltul din stanga litera modului: A, M sau L.
 
@@ -25,7 +30,7 @@
 
 // ===================== PINI =====================
 #define IR_PIN      3     // receptor IR (integrat pe shield)
-#define LED_PIN     9     // LED extern pentru semnalizare viteza
+#define LED_PIN     9     // LED extern
 #define SCL_Pin     A5    // matrice LED
 #define SDA_Pin     A4
 #define SERVO_PIN   A3
@@ -49,6 +54,9 @@
 #define KEY_1     0x16
 #define KEY_2     0x19
 #define KEY_3     0x0D
+#define KEY_4     0x0C
+#define KEY_6     0x5E
+#define KEY_0     0x52
 #define KEY_STAR  0x42
 #define KEY_HASH  0x4A
 
@@ -57,9 +65,11 @@
 const int SPEED_LEVELS[3] = {110, 160, 220};
 
 #define TURN_INNER_PCT   50   // la viraj, partea interioara merge inapoi cu atatea % din viteza
-#define TURN_INNER_MIN   100  // ...dar nu mai putin de atat (sub ~100 motoarele "tremura" si nu invart)
+#define TURN_INNER_MIN   100  // ...dar nu mai putin de atat (sub ~100 motoarele "tremura")
 #define LEFT_TRIM_PCT    100  // corectie viteza partea stanga  (ex. 110 daca e mai slaba)
 #define RIGHT_TRIM_PCT   100  // corectie viteza partea dreapta (ex. 90 daca e mai puternica)
+#define SPIN_POWER       255  // viteza rotirii pe loc (butoanele 4 si 6)
+#define SPIN_BLINK_MS    70   // clipire LED la rotire (aprins/stins)
 
 #define HOLD_TIMEOUT_MS  250  // cat asteapta dupa ultimul semnal IR inainte sa opreasca
 #define PING_INTERVAL_MS 60   // pauza intre masuratori ultrasunete (min ~60 ms)
@@ -70,9 +80,27 @@ const int SPEED_LEVELS[3] = {110, 160, 220};
 
 #define FOLLOW_BACK_CM  10    // mana mai aproape de atat -> da inapoi
 #define FOLLOW_STOP_CM  20    // intre 10 si 20 -> sta
-#define FOLLOW_MAX_CM   50    // intre 20 si 50 -> merge dupa mana; peste -> sta
+#define FOLLOW_MAX_CM   50    // intre 20 si 50 -> merge dupa mana; peste -> nu o "vede"
 
-#define BLINK_HALF_MS   70    // durata aprins/stins a LED-ului (clipire rapida)
+// --- Servo ---
+#define SERVO_CENTER        90
+#define SERVO_HIGH_IS_LEFT  1    // 1: unghiurile > 90 sunt in STANGA. Pune 0 daca se intoarce invers
+#define SWEEP_MIN           30   // butonul 0: limitele miscarii stanga-dreapta
+#define SWEEP_MAX           150
+#define SWEEP_STEP          5    // grade pe pas
+#define SWEEP_STEP_MS       20   // ms intre pasi
+
+// --- Urmarirea manii cu servo ---
+#define FOLLOW_SCAN_MIN     40   // zona in care cauta mana (grade)
+#define FOLLOW_SCAN_MAX     140
+#define FOLLOW_SEARCH_STEP  6    // pas la cautare
+#define FOLLOW_TRACK_SPAN   10   // dupa gasire verifica la -10, 0, +10 grade
+#define FOLLOW_ALIGN_DEG    12   // peste atat fata de centru, robotul se intoarce spre mana
+#define FOLLOW_TURN_MS      120  // durata unui impuls de intoarcere
+#define FOLLOW_TURN_DEG     10   // cat se estimeaza ca s-a intors dupa un impuls
+#define FOLLOW_LOST_CYCLES  3    // cicluri fara mana dupa care reia cautarea
+
+#define BLINK_HALF_MS   70    // clipire LED la limita de viteza (aprins/stins)
 #define DEBUG_IR        1     // 1 = scrie in Serial Monitor codul fiecarui buton
 #define DEBUG_DIST      1     // 1 = scrie distanta masurata (modurile 1 si 2)
 
@@ -86,14 +114,19 @@ const int SPEED_LEVELS[3] = {110, 160, 220};
 #define MODE_FOLLOW 2
 #define MODE_LINE   3
 
-#define MV_NONE  0
-#define MV_FRONT 1
-#define MV_BACK  2
-#define MV_LEFT  3
-#define MV_RIGHT 4
+#define MV_NONE   0
+#define MV_FRONT  1
+#define MV_BACK   2
+#define MV_LEFT   3
+#define MV_RIGHT  4
+#define MV_SPIN_L 5
+#define MV_SPIN_R 6
 
 #define AV_IDLE    0
 #define AV_BACKOFF 1
+
+#define FS_SEARCH 0
+#define FS_TRACK  1
 
 // ===================== FATA + LITERE (bit0 = sus, un byte = o coloana) =====================
 const uint8_t FACE[8]     = {0x3C, 0x42, 0xAD, 0xC1, 0xC1, 0xAD, 0x42, 0x3C};
@@ -105,7 +138,7 @@ const uint8_t LETTER_L[3] = {0x1F, 0x10, 0x10};
 Servo servo_A3;
 
 uint8_t  mode = MODE_MANUAL;
-uint8_t  curMove = MV_NONE;      // ce comanda are acum motoarele
+uint8_t  curMove = MV_NONE;      // ce comanda au acum motoarele
 uint8_t  heldMove = MV_NONE;     // directia tinuta apasata
 uint32_t lastSignalMs = 0;       // ultimul semnal IR primit pentru directia tinuta
 uint8_t  speedLevel = 1;         // 0 / 1 / 2
@@ -120,6 +153,27 @@ uint32_t nextPingMs = 0;
 
 uint8_t  blinkToggles = 0;
 uint32_t blinkNextMs = 0;
+
+// butonul 0 (miscare servo)
+bool     sweepHeld = false;
+uint32_t sweepSignalMs = 0;
+uint32_t sweepNextMs = 0;
+int      sweepAngle = SERVO_CENTER;
+int8_t   sweepDir = 1;
+
+// urmarire mana
+uint8_t  fState = FS_SEARCH;
+int      fAngle = SERVO_CENTER;  // unghiul comandat servo-ului
+int8_t   fDir = 1;               // sensul cautarii
+int      fLock = SERVO_CENTER;   // unghiul la care e mana
+uint8_t  fIdx = 0;               // care dintre cele 3 pozitii se masoara
+int      fReadD[3] = {0, 0, 0};  // distantele din ciclul curent (0 = nimic)
+int      fReadA[3] = {0, 0, 0};  // unghiurile corespunzatoare
+uint8_t  fLost = 0;
+uint32_t fReadyMs = 0;           // cand a ajuns servo-ul si se poate citi
+uint32_t fTurnEndMs = 0;
+
+const int8_t TRACK_OFFSETS[3] = {-FOLLOW_TRACK_SPAN, 0, FOLLOW_TRACK_SPAN};
 
 // ===================== SETUP / LOOP =====================
 void setup() {
@@ -140,7 +194,7 @@ void setup() {
   setUltrasonicPins(TRIG_PIN, ECHO_PIN);
 
   servo_A3.attach(SERVO_PIN);           // senzorul de distanta priveste drept
-  servo_A3.write(90);
+  servo_A3.write(SERVO_CENTER);
   delay(300);
 
   IrReceiver.begin(IR_PIN, false);      // false = fara LED feedback (pin 13 e ECHO)
@@ -156,6 +210,7 @@ void setup() {
 void loop() {
   handleIR();
   updateHold();
+  updateSweep();
   updateAuto();
   updateBlink();
 }
@@ -167,7 +222,9 @@ void handleIR() {
   if (IrReceiver.decodedIRData.protocol != UNKNOWN) {
     if (IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT) {
       // buton tinut apasat: reinnoim "permisiunea" de miscare
-      if (heldMove != MV_NONE) lastSignalMs = millis();
+      uint32_t now = millis();
+      if (heldMove != MV_NONE) lastSignalMs = now;
+      if (sweepHeld) sweepSignalMs = now;
     } else {
       uint8_t cmd = IrReceiver.decodedIRData.command;
 #if DEBUG_IR
@@ -181,12 +238,16 @@ void handleIR() {
 }
 
 void onKey(uint8_t cmd) {
+  if (cmd != KEY_0) stopSweep();         // orice alt buton opreste miscarea servo-ului
   switch (cmd) {
-    case KEY_FRONT: startManual(MV_FRONT); break;
-    case KEY_BACK:  startManual(MV_BACK);  break;
-    case KEY_LEFT:  startManual(MV_LEFT);  break;
-    case KEY_RIGHT: startManual(MV_RIGHT); break;
-    case KEY_STOP:  stopAll();             break;
+    case KEY_FRONT: startManual(MV_FRONT);  break;
+    case KEY_BACK:  startManual(MV_BACK);   break;
+    case KEY_LEFT:  startManual(MV_LEFT);   break;
+    case KEY_RIGHT: startManual(MV_RIGHT);  break;
+    case KEY_4:     startManual(MV_SPIN_L); break;
+    case KEY_6:     startManual(MV_SPIN_R); break;
+    case KEY_0:     startSweep();           break;
+    case KEY_STOP:  stopAll();              break;
     case KEY_1:     startMode(MODE_AVOID);  break;
     case KEY_2:     startMode(MODE_FOLLOW); break;
     case KEY_3:     startMode(MODE_LINE);   break;
@@ -196,7 +257,7 @@ void onKey(uint8_t cmd) {
 }
 
 void startManual(uint8_t m) {
-  // din urmarire mana / linie, orice sageata preia comanda; modul paza ramane activ
+  // din urmarire mana / linie, orice miscare preia comanda; modul paza ramane activ
   if (mode == MODE_FOLLOW || mode == MODE_LINE) setMode(MODE_MANUAL);
   if (mode == MODE_AVOID && avState == AV_BACKOFF) return;   // se retrage, ignoram tastele
 
@@ -232,6 +293,9 @@ void startMode(uint8_t m) {
 void setMode(uint8_t m) {
   mode = m;
   avState = AV_IDLE;
+  if (m == MODE_FOLLOW)      followStart();
+  else if (!sweepHeld)       servo_A3.write(SERVO_CENTER);   // senzorul priveste drept
+  fAngle = (m == MODE_FOLLOW) ? fAngle : SERVO_CENTER;
   show_face(m);
 }
 
@@ -242,6 +306,39 @@ void updateHold() {
     heldMove = MV_NONE;
     drive(MV_NONE);
   }
+}
+
+// ===================== SERVO: butonul 0 =====================
+void startSweep() {
+  if (sweepHeld) return;
+  heldMove = MV_NONE;
+  drive(MV_NONE);                        // robotul sta, modurile automate sunt in pauza
+  avState = AV_IDLE;
+  sweepHeld = true;
+  sweepSignalMs = millis();
+  sweepNextMs = millis();
+  sweepAngle = SERVO_CENTER;
+  sweepDir = 1;
+}
+
+void stopSweep() {
+  if (!sweepHeld) return;
+  sweepHeld = false;
+  servo_A3.write(SERVO_CENTER);          // revine la 90
+  fAngle = SERVO_CENTER;
+  if (mode == MODE_FOLLOW) followStart();   // reia cautarea de la capat
+}
+
+void updateSweep() {
+  if (!sweepHeld) return;
+  uint32_t now = millis();
+  if ((uint32_t)(now - sweepSignalMs) > HOLD_TIMEOUT_MS) { stopSweep(); return; }
+  if ((int32_t)(now - sweepNextMs) < 0) return;
+  sweepAngle += sweepDir * SWEEP_STEP;
+  if (sweepAngle >= SWEEP_MAX) { sweepAngle = SWEEP_MAX; sweepDir = -1; }
+  if (sweepAngle <= SWEEP_MIN) { sweepAngle = SWEEP_MIN; sweepDir = 1; }
+  servo_A3.write(sweepAngle);
+  sweepNextMs = now + SWEEP_STEP_MS;
 }
 
 // ===================== VITEZA (3 trepte) =====================
@@ -264,9 +361,30 @@ void startBlink() {
   blinkNextMs = millis();
 }
 
+// LED D9: clipeste rapid cat se invarta pe loc, altfel clipirile de la limita de viteza
 void updateBlink() {
-  if (blinkToggles == 0) return;
+  static bool wasSpin = false;
+  static bool spinLed = false;
   uint32_t now = millis();
+  bool spin = (curMove == MV_SPIN_L || curMove == MV_SPIN_R);
+
+  if (spin) {
+    wasSpin = true;
+    blinkToggles = 0;
+    if ((int32_t)(now - blinkNextMs) >= 0) {
+      spinLed = !spinLed;
+      digitalWrite(LED_PIN, spinLed ? HIGH : LOW);
+      blinkNextMs = now + SPIN_BLINK_MS;
+    }
+    return;
+  }
+  if (wasSpin) {                                    // s-a terminat rotirea
+    wasSpin = false;
+    spinLed = false;
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  if (blinkToggles == 0) return;
   if ((int32_t)(now - blinkNextMs) < 0) return;
   digitalWrite(LED_PIN, (blinkToggles % 2 == 0) ? HIGH : LOW);
   blinkToggles--;
@@ -275,6 +393,7 @@ void updateBlink() {
 
 // ===================== MODURI =====================
 void updateAuto() {
+  if (sweepHeld) return;                            // butonul 0 pune totul in pauza
   if (mode == MODE_LINE)   { runLine();   return; }
   if (mode == MODE_AVOID)  { runGuard();  return; }
   if (mode == MODE_FOLLOW) { runFollow(); return; }
@@ -323,22 +442,112 @@ void endBackoff() {
   avState = AV_IDLE;
 }
 
-// Modul 2 - urmarire mana
-void runFollow() {
-  uint32_t now = millis();
-  if ((int32_t)(now - nextPingMs) < 0) return;
-  int d = readDistanceCm();                          // 0 = fara ecou / necunoscut
-  nextPingMs = millis() + PING_INTERVAL_MS;
-  dbgDist(d);
+// ---------- Modul 2 - urmarire mana cu servo ----------
+int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-  if (d <= 0)                    drive(MV_NONE);
-  else if (d <= FOLLOW_BACK_CM)  drive(MV_BACK);
-  else if (d < FOLLOW_STOP_CM)   drive(MV_NONE);
-  else if (d <= FOLLOW_MAX_CM)   drive(MV_FRONT);
-  else                           drive(MV_NONE);
+// Muta servo-ul si calculeaza cand ajunge (mai mult timp pentru salturi mari).
+void servoGo(int a) {
+  a = clampi(a, FOLLOW_SCAN_MIN, FOLLOW_SCAN_MAX);
+  int delta = a > fAngle ? a - fAngle : fAngle - a;
+  fAngle = a;
+  servo_A3.write(a);
+  fReadyMs = millis() + 50 + (uint32_t)delta * 3;
 }
 
-// Modul 3 - urmarire linie
+void followStart() {
+  fState = FS_SEARCH;
+  fDir = 1;
+  fLost = 0;
+  fIdx = 0;
+  fAngle = SERVO_CENTER;
+  servo_A3.write(SERVO_CENTER);
+  fReadyMs = millis() + 250;                         // servo-ul poate veni de departe
+  drive(MV_NONE);
+}
+
+void followDecide() {
+  int best = 0;                                      // cea mai mica distanta din ciclu
+  for (uint8_t i = 0; i < 3; i++) {
+    if (fReadD[i] > 0 && (best == 0 || fReadD[i] < best)) best = fReadD[i];
+  }
+  if (best == 0) {                                   // nimic vazut in ciclul asta
+    drive(MV_NONE);
+    if (++fLost >= FOLLOW_LOST_CYCLES) {             // mana pierduta: reia cautarea
+      fState = FS_SEARCH;
+      fDir = (fAngle < SERVO_CENTER) ? 1 : -1;
+      fLost = 0;
+    }
+    return;
+  }
+  fLost = 0;
+  long sum = 0;                                      // centrul mainii = media unghiurilor
+  int cnt = 0;                                       // la care se vede (cam aceeasi distanta)
+  for (uint8_t i = 0; i < 3; i++) {
+    if (fReadD[i] > 0 && fReadD[i] <= best + 4) { sum += fReadA[i]; cnt++; }
+  }
+  int d = best;
+  fLock = clampi((int)(sum / cnt), FOLLOW_SCAN_MIN, FOLLOW_SCAN_MAX);
+
+  int off = fLock - SERVO_CENTER;                    // >0: unghi mare
+#if !SERVO_HIGH_IS_LEFT
+  off = -off;
+#endif
+  // off > 0 = mana e in STANGA robotului
+  if (off > FOLLOW_ALIGN_DEG || off < -FOLLOW_ALIGN_DEG) {
+    drive(off > 0 ? MV_LEFT : MV_RIGHT);             // impuls scurt de intoarcere
+    fTurnEndMs = millis() + FOLLOW_TURN_MS;
+    // estimam ca ne-am apropiat de centru
+    if (fLock > SERVO_CENTER) fLock = clampi(fLock - FOLLOW_TURN_DEG, SERVO_CENTER, FOLLOW_SCAN_MAX);
+    else                      fLock = clampi(fLock + FOLLOW_TURN_DEG, FOLLOW_SCAN_MIN, SERVO_CENTER);
+    return;
+  }
+  if (d <= FOLLOW_BACK_CM)      drive(MV_BACK);
+  else if (d < FOLLOW_STOP_CM)  drive(MV_NONE);
+  else if (d <= FOLLOW_MAX_CM)  drive(MV_FRONT);
+  else                          drive(MV_NONE);
+}
+
+void runFollow() {
+  uint32_t now = millis();
+  if ((curMove == MV_LEFT || curMove == MV_RIGHT) &&
+      (int32_t)(now - fTurnEndMs) >= 0) drive(MV_NONE);   // impuls de intoarcere terminat
+  if ((int32_t)(now - fReadyMs) < 0) return;
+
+  int d = readDistanceCm();                          // 0 = fara ecou / necunoscut
+  dbgDist(d);
+  bool hit = (d > 0 && d <= FOLLOW_MAX_CM);
+
+  if (fState == FS_SEARCH) {
+    if (curMove != MV_NONE) drive(MV_NONE);
+    if (hit) {                                       // am gasit mana: trecem la urmarire
+      fState = FS_TRACK;
+      fLock = fAngle;
+      fIdx = 0;
+      fLost = 0;
+      servoGo(fLock + TRACK_OFFSETS[0]);
+      return;
+    }
+    int next = fAngle + fDir * FOLLOW_SEARCH_STEP;
+    if (next >= FOLLOW_SCAN_MAX) { next = FOLLOW_SCAN_MAX; fDir = -1; }
+    if (next <= FOLLOW_SCAN_MIN) { next = FOLLOW_SCAN_MIN; fDir = 1; }
+    servoGo(next);
+    return;
+  }
+
+  // FS_TRACK: masuram la -10, 0, +10 grade fata de ultimul unghi
+  fReadD[fIdx] = hit ? d : 0;
+  fReadA[fIdx] = fAngle;
+  if (fIdx < 2) {
+    fIdx++;
+    servoGo(fLock + TRACK_OFFSETS[fIdx]);
+    return;
+  }
+  followDecide();
+  fIdx = 0;
+  servoGo(fLock + TRACK_OFFSETS[0]);
+}
+
+// ---------- Modul 3 - urmarire linie ----------
 void runLine() {
   bool l = digitalRead(LINE_L_PIN);
   bool m = digitalRead(LINE_M_PIN);
@@ -405,7 +614,9 @@ void dbgDist(int d) {
   if ((uint32_t)(now - last) >= 300) {
     last = now;
     Serial.print(F("dist cm: "));
-    Serial.println(d);
+    Serial.print(d);
+    Serial.print(F("  unghi servo: "));
+    Serial.println(fAngle);
   }
 #else
   (void)d;
@@ -437,6 +648,7 @@ void setRight(int p) { setSide(RIGHT_CTRL, RIGHT_PWM, (int)((long)p * RIGHT_TRIM
 // Rotile de pe aceeasi parte sunt legate in paralel pe shield, deci se comanda
 // ca o singura parte. La viraj: partea exterioara inainte, cea interioara
 // inapoi (TURN_INNER_PCT% din viteza, minim TURN_INNER_MIN).
+// Rotire pe loc: o parte inainte, cealalta inapoi, amandoua la SPIN_POWER.
 void drive(uint8_t m) {
   int s = speed;
   int inner = (s * TURN_INNER_PCT) / 100;
@@ -444,11 +656,13 @@ void drive(uint8_t m) {
   if (inner > s) inner = s;
   curMove = m;
   switch (m) {
-    case MV_FRONT: setLeft(s);       setRight(s);       break;
-    case MV_BACK:  setLeft(-s);      setRight(-s);      break;
-    case MV_LEFT:  setLeft(-inner);  setRight(s);       break;
-    case MV_RIGHT: setLeft(s);       setRight(-inner);  break;
-    default:       setLeft(0);       setRight(0);       break;
+    case MV_FRONT:  setLeft(s);           setRight(s);           break;
+    case MV_BACK:   setLeft(-s);          setRight(-s);          break;
+    case MV_LEFT:   setLeft(-inner);      setRight(s);           break;
+    case MV_RIGHT:  setLeft(s);           setRight(-inner);      break;
+    case MV_SPIN_L: setLeft(-SPIN_POWER); setRight(SPIN_POWER);  break;
+    case MV_SPIN_R: setLeft(SPIN_POWER);  setRight(-SPIN_POWER); break;
+    default:        setLeft(0);           setRight(0);           break;
   }
 }
 
