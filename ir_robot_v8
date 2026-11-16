@@ -1,25 +1,31 @@
 /*
   Keyestudio 4WD BT Car V2.0 (KS0559, driver DRV8833)
-  Robot controlat cu telecomanda IR  -  biblioteca IRremote 4.x   (v7)
+  Robot controlat cu telecomanda IR  -  biblioteca IRremote 4.x   (v8)
 
   TELECOMANDA
     Sus / Jos / Stanga / Dreapta : robotul merge DOAR cat tii butonul apasat
     OK                           : stop (o singura apasare) + iese din orice mod
-    1  PAZA (A)    : tu conduci. Daca mergi inainte si apare ceva la <= 15 cm,
+    1  PAZA        : tu conduci. Daca mergi inainte si apare ceva la <= 15 cm,
                      robotul se opreste, da putin in spate si NU te mai lasa inainte
                      cat tii apasat; dai drumul la buton si il poti apasa din nou.
-    2  URMARIRE MANA (M) : servo-ul scaneaza, gaseste mana, o urmareste si se
+    2  URMARIRE MANA : servo-ul scaneaza, gaseste mana, o urmareste si se
                      intoarce spre ea; apoi tine distanta (OK = iesire)
-    3  URMARIRE LINIE (L) : urmareste linia neagra de pe jos (OK = iesire)
-    0  cat tii apasat: servo-ul se misca stanga-dreapta; la eliberare revine la 90.
-       Cat e apasat, robotul sta pe loc si modurile 2/3 sunt in pauza.
+    3  URMARIRE LINIE : urmareste linia neagra de pe jos (OK = iesire)
     4  cat tii apasat: se invarta pe loc spre STANGA foarte rapid + LED D9 clipeste rapid
     6  cat tii apasat: se invarta pe loc spre DREAPTA foarte rapid + LED D9 clipeste rapid
+    5  cat tii apasat: servo-ul se misca stanga-dreapta; la eliberare revine la 90.
+       Cat e apasat, robotul sta pe loc si modurile 1/2/3 sunt in pauza.
     *  treapta de viteza mai mare   (3 trepte; la maxim LED-ul D9 clipeste de 3 ori)
     #  treapta de viteza mai mica   (la minim LED-ul D9 clipeste de 3 ori)
-    7, 8, 9 : rezervate pentru display (nefolosite deocamdata)
 
-  DISPLAY: fata mare mereu in centru; in coltul din stanga litera modului: A, M sau L.
+  DISPLAY (desenul ramane pe ecran pana apesi alt buton de display)
+    7  fata zambitoare (si desenul de la pornire)
+    8  inima
+    9  scrie "HEY"
+    0  scrie "BYE"
+  Modul activ se vede cu pixeli aprinsi in coltul din stanga-sus, deasupra desenului:
+    modul 1 = 1 pixel, modul 2 = 2 pixeli, modul 3 = 3 pixeli, niciun mod = niciun pixel.
+    (SHOW_MODE_PIXELS 0 ii dezactiveaza)
 
   La pornire robotul testeaza senzorul de distanta si scrie rezultatul in
   Serial Monitor (9600 baud). Daca Trig si Echo sunt inversate, le detecteaza singur.
@@ -55,8 +61,12 @@
 #define KEY_2     0x19
 #define KEY_3     0x0D
 #define KEY_4     0x0C
+#define KEY_5     0x18    // servo stanga-dreapta
 #define KEY_6     0x5E
-#define KEY_0     0x52
+#define KEY_7     0x08    // display: fata zambitoare
+#define KEY_8     0x1C    // display: inima
+#define KEY_9     0x5A    // display: "HEY"
+#define KEY_0     0x52    // display: "BYE"
 #define KEY_STAR  0x42
 #define KEY_HASH  0x4A
 
@@ -85,7 +95,7 @@ const int SPEED_LEVELS[3] = {110, 160, 220};
 // --- Servo ---
 #define SERVO_CENTER        90
 #define SERVO_HIGH_IS_LEFT  1    // 1: unghiurile > 90 sunt in STANGA. Pune 0 daca se intoarce invers
-#define SWEEP_MIN           30   // butonul 0: limitele miscarii stanga-dreapta
+#define SWEEP_MIN           30   // butonul 5: limitele miscarii stanga-dreapta
 #define SWEEP_MAX           150
 #define SWEEP_STEP          5    // grade pe pas
 #define SWEEP_STEP_MS       20   // ms intre pasi
@@ -104,7 +114,9 @@ const int SPEED_LEVELS[3] = {110, 160, 220};
 #define DEBUG_IR        1     // 1 = scrie in Serial Monitor codul fiecarui buton
 #define DEBUG_DIST      1     // 1 = scrie distanta masurata (modurile 1 si 2)
 
-// Daca litera/fata apar rasturnate pe display, schimba aici:
+#define SHOW_MODE_PIXELS 1    // 1 = pixeli de mod in coltul din stanga-sus (1/2/3 pixeli)
+
+// Daca desenul apare rasturnat pe display, schimba aici:
 #define MATRIX_MIRROR_H 0     // 1 = oglindeste stanga-dreapta
 #define MATRIX_FLIP_V   0     // 1 = oglindeste sus-jos
 
@@ -128,11 +140,16 @@ const int SPEED_LEVELS[3] = {110, 160, 220};
 #define FS_SEARCH 0
 #define FS_TRACK  1
 
-// ===================== FATA + LITERE (bit0 = sus, un byte = o coloana) =====================
-const uint8_t FACE[8]     = {0x3C, 0x42, 0xAD, 0xC1, 0xC1, 0xAD, 0x42, 0x3C};
-const uint8_t LETTER_A[3] = {0x1E, 0x05, 0x1E};
-const uint8_t LETTER_M[3] = {0x1F, 0x06, 0x1F};
-const uint8_t LETTER_L[3] = {0x1F, 0x10, 0x10};
+// ===================== DESENE (un byte = o coloana, bit0 = randul de sus) =====================
+// Coltul din stanga-sus (coloanele 0..2, randul de sus) ramane liber pentru pixelii de mod.
+const uint8_t PIC_FACE[16] = {0x00, 0x00, 0x00, 0x00, 0x3C, 0x42, 0x95, 0xA1, 0xA1, 0x95, 0x42, 0x3C, 0x00, 0x00, 0x00, 0x00};
+const uint8_t PIC_HEART[16] = {0x00, 0x00, 0x00, 0x00, 0x0E, 0x1F, 0x3F, 0x7E, 0x7E, 0x3F, 0x1F, 0x0E, 0x00, 0x00, 0x00, 0x00};
+const uint8_t PIC_HEY[16] = {0x00, 0x7E, 0x08, 0x08, 0x7E, 0x00, 0x7E, 0x4A, 0x4A, 0x42, 0x00, 0x06, 0x78, 0x78, 0x06, 0x00};
+const uint8_t PIC_BYE[16] = {0x00, 0x7E, 0x4A, 0x4A, 0x34, 0x00, 0x06, 0x78, 0x78, 0x06, 0x00, 0x7E, 0x4A, 0x4A, 0x42, 0x00};
+
+#define PIC_COUNT 4
+const uint8_t* const PICTURES[PIC_COUNT] = {PIC_FACE, PIC_HEART, PIC_HEY, PIC_BYE};
+uint8_t picture = 0;             // desenul de pe ecran: 0 fata, 1 inima, 2 HEY, 3 BYE
 
 // ===================== STARE =====================
 Servo servo_A3;
@@ -154,7 +171,7 @@ uint32_t nextPingMs = 0;
 uint8_t  blinkToggles = 0;
 uint32_t blinkNextMs = 0;
 
-// butonul 0 (miscare servo)
+// butonul 5 (miscare servo)
 bool     sweepHeld = false;
 uint32_t sweepSignalMs = 0;
 uint32_t sweepNextMs = 0;
@@ -201,7 +218,7 @@ void setup() {
 
   pinMode(SCL_Pin, OUTPUT);
   pinMode(SDA_Pin, OUTPUT);
-  show_face(MODE_MANUAL);
+  show_screen();                        // la pornire: fata zambitoare
 
   checkUltrasonic();
   Serial.println(F("Robot pornit"));
@@ -238,7 +255,7 @@ void handleIR() {
 }
 
 void onKey(uint8_t cmd) {
-  if (cmd != KEY_0) stopSweep();         // orice alt buton opreste miscarea servo-ului
+  if (cmd != KEY_5) stopSweep();         // orice alt buton opreste miscarea servo-ului
   switch (cmd) {
     case KEY_FRONT: startManual(MV_FRONT);  break;
     case KEY_BACK:  startManual(MV_BACK);   break;
@@ -246,7 +263,11 @@ void onKey(uint8_t cmd) {
     case KEY_RIGHT: startManual(MV_RIGHT);  break;
     case KEY_4:     startManual(MV_SPIN_L); break;
     case KEY_6:     startManual(MV_SPIN_R); break;
-    case KEY_0:     startSweep();           break;
+    case KEY_5:     startSweep();           break;
+    case KEY_7:     showPicture(0);         break;
+    case KEY_8:     showPicture(1);         break;
+    case KEY_9:     showPicture(2);         break;
+    case KEY_0:     showPicture(3);         break;
     case KEY_STOP:  stopAll();              break;
     case KEY_1:     startMode(MODE_AVOID);  break;
     case KEY_2:     startMode(MODE_FOLLOW); break;
@@ -296,7 +317,7 @@ void setMode(uint8_t m) {
   if (m == MODE_FOLLOW)      followStart();
   else if (!sweepHeld)       servo_A3.write(SERVO_CENTER);   // senzorul priveste drept
   fAngle = (m == MODE_FOLLOW) ? fAngle : SERVO_CENTER;
-  show_face(m);
+  show_screen();
 }
 
 // Oprire cand nu mai vine semnal IR (butonul a fost eliberat)
@@ -308,7 +329,7 @@ void updateHold() {
   }
 }
 
-// ===================== SERVO: butonul 0 =====================
+// ===================== SERVO: butonul 5 =====================
 void startSweep() {
   if (sweepHeld) return;
   heldMove = MV_NONE;
@@ -393,7 +414,7 @@ void updateBlink() {
 
 // ===================== MODURI =====================
 void updateAuto() {
-  if (sweepHeld) return;                            // butonul 0 pune totul in pauza
+  if (sweepHeld) return;                            // butonul 5 pune totul in pauza
   if (mode == MODE_LINE)   { runLine();   return; }
   if (mode == MODE_AVOID)  { runGuard();  return; }
   if (mode == MODE_FOLLOW) { runFollow(); return; }
@@ -667,17 +688,18 @@ void drive(uint8_t m) {
 }
 
 // ===================== MATRICE LED =====================
-// Fata mare in centru (coloanele 4..11) + litera modului in coltul din stanga.
-void show_face(uint8_t m) {
+// Desenul ales (7/8/9/0) ramane pe ecran; peste el apar pixelii modului activ.
+void show_screen() {
   uint8_t frame[16];
-  for (uint8_t i = 0; i < 16; i++) frame[i] = 0;
-  for (uint8_t i = 0; i < 8; i++) frame[4 + i] = FACE[i];
+  for (uint8_t i = 0; i < 16; i++) frame[i] = PICTURES[picture][i];
 
-  const uint8_t *g = 0;
-  if (m == MODE_AVOID)       g = LETTER_A;
-  else if (m == MODE_FOLLOW) g = LETTER_M;
-  else if (m == MODE_LINE)   g = LETTER_L;
-  if (g) for (uint8_t i = 0; i < 3; i++) frame[i] = g[i];
+#if SHOW_MODE_PIXELS
+  uint8_t n = 0;
+  if (mode == MODE_AVOID)       n = 1;
+  else if (mode == MODE_FOLLOW) n = 2;
+  else if (mode == MODE_LINE)   n = 3;
+  for (uint8_t i = 0; i < n; i++) frame[i] |= 0x01;   // randul de sus, din stanga
+#endif
 
 #if MATRIX_FLIP_V
   for (uint8_t i = 0; i < 16; i++) {
@@ -692,6 +714,12 @@ void show_face(uint8_t m) {
   }
 #endif
   matrix_display(frame);
+}
+
+void showPicture(uint8_t p) {
+  if (p >= PIC_COUNT) return;
+  picture = p;
+  show_screen();
 }
 
 void matrix_display(const uint8_t *matrix_value) {
